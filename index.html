@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>tja最適化ツール</title>
+<style>
+body{margin:0;background:#f4f6f8;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;}
+.container{max-width:1000px;margin:auto;padding:12px;}
+.editorWrap{position:relative;}
+.render{
+  position:absolute; inset:0;
+  padding:10px;
+  font-family:monospace;
+  font-size:15px;
+  line-height:1.5;
+  white-space:pre-wrap;
+  word-break:break-word;
+  overflow:hidden;
+  pointer-events:none;
+}
+.render .err{color:#c00;}
+textarea{
+  position:relative;
+  width:100%;
+  height:50vh;
+  padding:10px;
+  font-family:monospace;
+  font-size:15px;
+  line-height:1.5;
+  border-radius:8px;
+  border:1px solid #ccc;
+  resize:vertical;
+  box-sizing:border-box;
+  background:transparent;
+  color:transparent;
+  caret-color:#000;
+  overflow:auto;
+}
+.buttonRow{display:flex;gap:8px;margin-top:10px;}
+button{flex:1;padding:12px;border:none;border-radius:8px;font-weight:bold;cursor:pointer;}
+.secondary{background:#444;color:white;}
+.export{background:#0a8f3c;color:white;}
+.filebtn{
+  margin-top:10px;padding:12px;background:#777;color:white;
+  border-radius:8px;display:inline-block;cursor:pointer;font-weight:bold;
+}
+input[type=file]{display:none;}
+.stats,.result{margin-top:10px;background:white;padding:8px;border-radius:8px;font-size:13px;}
+.errorItem{border-left:4px solid red;padding:6px;margin-bottom:4px;background:#fff5f5;cursor:pointer;}
+.good{border-left:4px solid green;padding:6px;background:#f0fff0;}
+</style>
+</head>
+<body>
+<div class="container">
+
+<h3>tja最適化ツール</h3>
+
+<div class="editorWrap">
+  <div id="render" class="render"></div>
+  <textarea id="text" spellcheck="false"></textarea>
+</div>
+
+<div class="buttonRow">
+<button class="secondary" onclick="fixAll()">一括修正</button>
+<button class="export" onclick="exportTJA()">SJIS出力</button>
+</div>
+
+<label class="filebtn">
+ファイル読み込み（.tja/.txt）
+<input type="file" id="fileInput">
+</label>
+
+<div id="stats" class="stats"></div>
+<div id="result" class="result"></div>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/encoding-japanese/2.0.0/encoding.min.js"></script>
+<script>
+
+const ta=document.getElementById("text");
+const render=document.getElementById("render");
+const stats=document.getElementById("stats");
+const result=document.getElementById("result");
+const fileInput=document.getElementById("fileInput");
+
+/* ===================== 共通 ===================== */
+
+function esc(s){return s.replace(/[&<>]/g,m=>({ "&":"&amp;","<":"&lt;",">":"&gt;"}[m]));}
+function gcd(a,b){return b?gcd(b,a%b):a;}
+function isNumber(v){return /^[0-9]+(\.[0-9]+)?$/.test(v);}
+function isMeasure(v){return /^[0-9]+\/[0-9]+$/.test(v);}
+function isNote(line){
+  const t=line.trim();
+  if(!t||t.startsWith("#"))return false;
+  return /[0-9]/.test(t)&&t.includes(",");
+}
+
+/* ===================== 描画 ===================== */
+
+function renderWithErrors(errorSet){
+  const lines=ta.value.replace(/\r/g,"").split("\n");
+  let html="";
+  for(let i=0;i<lines.length;i++){
+    const cls=errorSet.has(i)?"err":"";
+    html+=`<div class="${cls}">${esc(lines[i]||" ")}</div>`;
+  }
+  render.innerHTML=html;
+  render.scrollTop=ta.scrollTop;
+}
+
+/* ===================== ノーツ圧縮 ===================== */
+
+function compressNotes(line){
+  const t=line.trim();
+  if(!/^[0-9]+,$/.test(t))return line;
+  const body=t.slice(0,-1);
+  const pos=[];
+  for(let i=0;i<body.length;i++)if(body[i]!=="0")pos.push(i);
+  if(pos.length<=1)return line;
+  let step=pos[1]-pos[0];
+  for(let i=2;i<pos.length;i++)step=gcd(step,pos[i]-pos[i-1]);
+  if(step<=1)return line;
+  let out="";
+  for(let i=0;i<body.length;i+=step)out+=body[i];
+  return out+",";
+}
+
+/* ===================== 最適化 ===================== */
+
+function simulateOptimization(text){
+  const lines=text.split("\n");
+  const out=[];
+  let gogo=false,bar=true;
+  let last={SCROLL:null,BPMCHANGE:null,MEASURE:null};
+
+  for(let raw of lines){
+
+    if(/^[08]+,\s*$/.test(raw.trim())){out.push(",");continue;}
+
+    raw=compressNotes(raw);
+
+    const m=raw.trim().match(/^#([A-Za-z]+)\s*(.*)?/);
+    if(!m){out.push(raw);continue;}
+
+    const key=m[1].toUpperCase();
+    const val=(m[2]||"").trim();
+
+    if(key==="GOGOSTART"){if(gogo)continue;gogo=true;}
+    if(key==="GOGOEND"){if(!gogo)continue;gogo=false;}
+    if(key==="BARLINEON"){if(bar)continue;bar=true;}
+    if(key==="BARLINEOFF"){if(!bar)continue;bar=false;}
+
+    if(["SCROLL","BPMCHANGE","MEASURE"].includes(key)){
+      if(last[key]===val)continue;
+      last[key]=val;
+    }
+
+    out.push(raw);
+  }
+
+  if(gogo)out.push("#GOGOEND");
+  return out.join("\n");
+}
+
+/* ===================== 統計 ===================== */
+
+function updateStats(){
+  const cur=ta.value.length;
+  const sim=simulateOptimization(ta.value).length;
+  const diff=cur-sim;
+  const pct=cur>0?((diff/cur)*100).toFixed(2):"0.00";
+  stats.innerHTML=
+    "現在文字数: "+cur+
+    "<br>暫定修正後文字数: "+sim+
+    "<br>削減可能文字数: "+diff+
+    "<br>削減率: "+pct+"%";
+}
+
+/* ===================== 検査 ===================== */
+
+function fullCheck(){
+  const lines=ta.value.split("\n");
+  const errs=[];
+  const errorSet=new Set();
+  let gogo=false,bar=true;
+  let last={SCROLL:null,BPMCHANGE:null,MEASURE:null};
+  const starts=[],ends=[];
+
+  for(let i=0;i<lines.length;i++){
+    const raw=lines[i];
+    const t=raw.trim();
+    const m=t.match(/^#([A-Za-z]+)\s*(.*)?/);
+
+    if(m){
+      const key=m[1].toUpperCase();
+      const val=(m[2]||"").trim();
+
+      if(key==="START")starts.push(i);
+      if(key==="END")ends.push(i);
+
+      if(key==="GOGOSTART"){if(gogo){errs.push({line:i,msg:"GOGOSTART 重複"});errorSet.add(i);}gogo=true;}
+      if(key==="GOGOEND"){if(!gogo){errs.push({line:i,msg:"GOGOEND 対応なし"});errorSet.add(i);}gogo=false;}
+
+      if(key==="BARLINEON"){if(bar){errs.push({line:i,msg:"BARLINEON 重複"});errorSet.add(i);}bar=true;}
+      if(key==="BARLINEOFF"){if(!bar){errs.push({line:i,msg:"BARLINEOFF 重複"});errorSet.add(i);}bar=false;}
+
+      if(["SCROLL","BPMCHANGE"].includes(key)){
+        if(!val||!isNumber(val)){errs.push({line:i,msg:key+" 数値不正"});errorSet.add(i);}
+      }
+      if(key==="MEASURE"){
+        if(!val||!isMeasure(val)){errs.push({line:i,msg:"MEASURE 形式不正"});errorSet.add(i);}
+      }
+
+      if(["SCROLL","BPMCHANGE","MEASURE"].includes(key)){
+        if(last[key]===val){errs.push({line:i,msg:key+" 連続同値"});errorSet.add(i);}
+        last[key]=val;
+      }
+    }
+  }
+
+  if(gogo){errs.push({line:lines.length-1,msg:"GOGOSTART 未閉じ"});errorSet.add(lines.length-1);}
+  if(starts.length===0)errs.push({line:null,msg:"#START が存在しません"});
+  if(ends.length===0)errs.push({line:null,msg:"#END が存在しません"});
+
+  if(starts.length>0){
+    for(let i=0;i<starts[0];i++){
+      if(isNote(lines[i])){errs.push({line:i,msg:"#START より前に音符"});errorSet.add(i);}
+    }
+  }
+  if(ends.length>0){
+    for(let i=ends[ends.length-1]+1;i<lines.length;i++){
+      if(isNote(lines[i])){errs.push({line:i,msg:"#END より後に音符"});errorSet.add(i);}
+    }
+  }
+
+  if(errs.length===0){
+    result.innerHTML='<div class="good">エラーなし</div>';
+  }else{
+    let html="";
+    errs.forEach(e=>{
+      if(e.line!==null){
+        html+=`<div class="errorItem" onclick="jumpTo(${e.line})">行${e.line+1}: ${e.msg}</div>`;
+      }else{
+        html+=`<div class="errorItem">${e.msg}</div>`;
+      }
+    });
+    result.innerHTML=html;
+  }
+
+  renderWithErrors(errorSet);
+}
+
+/* ===================== 中央移動 ===================== */
+
+function jumpTo(line){
+  const lines=ta.value.split("\n");
+  let offset=0;
+  for(let i=0;i<line;i++)offset+=lines[i].length+1;
+
+  const lineHeight=parseFloat(getComputedStyle(ta).lineHeight);
+  const areaHeight=ta.clientHeight;
+
+  let target=(line*lineHeight)-(areaHeight/2)+(lineHeight/2);
+  if(target<0)target=0;
+
+  ta.scrollTo({top:target,behavior:"smooth"});
+  setTimeout(()=>ta.setSelectionRange(offset,offset+lines[line].length),200);
+}
+
+/* ===================== 同期 ===================== */
+
+ta.addEventListener("input",()=>{
+  updateStats();
+  fullCheck();
+});
+ta.addEventListener("scroll",()=>render.scrollTop=ta.scrollTop);
+
+/* ===================== 修正 ===================== */
+
+function fixAll(){
+  ta.value=simulateOptimization(ta.value);
+  updateStats();
+  fullCheck();
+}
+
+/* ===================== 出力 ===================== */
+
+function exportTJA(){
+  const utf8=new TextEncoder().encode(ta.value);
+  const sjis=Encoding.convert(utf8,{to:"SJIS",from:"UTF8",type:"array"});
+  const blob=new Blob([new Uint8Array(sjis)]);
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(blob);
+  a.download="optimized.tja";
+  a.click();
+}
+
+/* ===================== 読込 ===================== */
+
+fileInput.addEventListener("change",e=>{
+  const f=e.target.files[0];
+  if(!f)return;
+  const reader=new FileReader();
+  reader.onload=ev=>{
+    const bytes=new Uint8Array(ev.target.result);
+    const enc=Encoding.detect(bytes)||"UTF8";
+    const text=Encoding.convert(bytes,{to:"UNICODE",from:enc,type:"string"});
+    ta.value=text;
+    updateStats();
+    fullCheck();
+  };
+  reader.readAsArrayBuffer(f);
+});
+
+updateStats();
+fullCheck();
+
+</script>
+</body>
+</html>
